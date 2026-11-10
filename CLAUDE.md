@@ -49,36 +49,34 @@ Referencia visual de formatos: `image.png`.
 
 ### Pendiente
 
-1. **Instalador `curl ... | bash`** con detección Fedora/Ubuntu. No iniciado.
-   No hay URL de repositorio todavía; habrá que decidir dónde publicarlo.
+1. ~~Instalador `curl ... | bash`~~ — hecho: `install.sh` (ver §12).
 2. ~~Probar RVZ real~~ — hecho (ver §10).
 3. Decidir si se soportan `.nds`/`.cia` (ahora se omiten; EmuDeck tampoco los
    soporta) y `.cdi` de Dreamcast (ahora se omite).
 4. Valorar si se añaden `.d88`/`.hdf`/`.xdf` de X68000 (ahora se omiten).
-5. Hacer commit cuando el usuario lo pida. Ahora mismo todo está sin commitear.
+5. Queda una rama remota `develop` sobrante (ver §3); el usuario decide si
+   borrarla.
 
 ## 3. Archivos del repositorio
 
 ```
 /home/pandi/Projects/emu.compress.roms/
-├── emu-compress      # script principal (untracked, ejecutable)
-├── README.md         # documentación (modificado, antes era solo el título)
-├── PROYECTO.md       # requisitos originales (untracked)
-├── image.png         # referencia de formatos de EmuDeck (untracked)
+├── emu-compress      # script principal (ejecutable)
+├── install.sh        # instalador curl | bash
+├── README.md         # documentación
+├── PROYECTO.md       # requisitos originales
+├── image.png         # referencia de formatos de EmuDeck
 └── CLAUDE.md         # este documento
 ```
 
-Estado Git:
+Git:
 
-```
- M README.md
-?? PROYECTO.md
-?? emu-compress
-?? image.png
-?? CLAUDE.md
-```
-
-No se ha hecho ningún commit.
+- Remoto: `https://github.com/jlcampana/emu.compress.roms` (público).
+- Rama de trabajo y por defecto en GitHub: **`main`**. El usuario renombró
+  `develop` → `main` en GitHub. Un push accidental volvió a crear `develop` en
+  el remoto (mismo commit que `main`); no se borró porque el clasificador
+  bloqueó borrar ramas remotas. Trabajar siempre en `main`.
+- El usuario quiere **commit + push en cada pequeño hito**.
 
 ## 4. Rutas reales importantes
 
@@ -373,26 +371,27 @@ Incluye 21 CHD y 25 7z (`.pce`, `.sfc`, `.md`, `.gba`, `.gb`, etc.).
 
 ## 12. Próximos pasos recomendados
 
-1. **Instalador**:
-   - Crear `install.sh` que detecte Fedora/Ubuntu con `/etc/os-release`.
-   - Fedora: `sudo dnf install mame-tools 7zip`.
-   - Ubuntu/Debian: `sudo apt install mame-tools p7zip-full`.
-   - Descargar `emu-compress` desde la URL del repositorio y copiarlo a
-     `~/.local/bin/` (o `/usr/local/bin/`).
-   - Hacerlo compatible con `curl ... | bash`.
-   - Decidir URL definitiva del repositorio.
-2. **Probar RVZ real**:
-   - Copiar una ISO pequeña de GC/Wii a `/tmp` y ejecutar
-     `emu-compress compress` con `--verify`.
-   - Comprobar que Dolphin Flatpak se invoca bien.
-3. **Decidir formatos pendientes**:
+1. **Instalador** (hecho):
+   - `curl -fsSL https://raw.githubusercontent.com/jlcampana/emu.compress.roms/main/install.sh | bash`
+   - dnf (Fedora/RHEL) o apt (Ubuntu/Debian) según `/etc/os-release`.
+     Paquetes: `mame-tools` + `7zip` (fallback `p7zip-full`/`p7zip`).
+   - `--with-dolphin`: Fedora → `dolphin-emu-tool` (trae `/usr/bin/dolphin-tool`);
+     resto → Flatpak de Flathub. El `.deb` `dolphin-emu` de Ubuntu **no**
+     incluye `dolphin-tool`.
+   - Desde un clon copia el script local; con `curl | bash` lo descarga.
+   - Probado en contenedores podman limpios: Fedora 44, Ubuntu 24.04,
+     Ubuntu 26.04 y Debian 13, incluido el `curl | bash` real desde GitHub y
+     el RVZ ida y vuelta con `dolphin-tool` nativo (CRC `b3bc4aee`).
+   - Sin probar: usuario no root con `sudo` interactivo, SteamOS y Arch
+     (solo muestran avisos).
+2. **Decidir formatos pendientes**:
    - `.nds`/`.cia`: EmuDeck no los soporta; probablemente dejarlos omitidos.
    - `.cdi` de Dreamcast: EmuDeck no lo convierte; probablemente omitido.
    - `.d88`/`.hdf`/`.xdf` de X68000: valorar si añadirlos a 7z.
-4. **Documentación**:
+3. **Documentación**:
    - Actualizar README/help si se añade algo nuevo.
    - Mantener este `CLAUDE.md` al día.
-5. **Commit** cuando el usuario lo pida.
+4. Commit + push en cada hito (rama `main`).
 
 ## 13. Comandos útiles
 

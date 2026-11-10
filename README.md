@@ -4,6 +4,39 @@ Script para comprimir y descomprimir ROMs e ISOs de emuladores, inspirado en
 la herramienta de compresión de EmuDeck pero trabajando sobre el directorio
 actual en lugar de rutas fijas.
 
+## Instalación
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jlcampana/emu.compress.roms/main/install.sh | bash
+```
+
+El instalador:
+
+- Detecta la distribución con `/etc/os-release`: Fedora (y derivadas RHEL
+  con EPEL) con `dnf`; Ubuntu, Debian y derivadas con `apt`.
+- Instala `chdman` (`mame-tools`) y `7z` (`7zip`, o `p7zip` en sistemas
+  antiguos) si no están ya. Pide confirmación y usa `sudo`.
+- Copia `emu-compress` en `~/.local/bin` y avisa si esa carpeta no está en el
+  `PATH`.
+- Al final muestra qué herramientas hay y cuáles faltan.
+
+Opciones (tras `bash -s --`):
+
+```bash
+# Instala también dolphin-tool para RVZ de GameCube/Wii
+# (Fedora: paquete dolphin-emu-tool; resto: Flatpak de Flathub)
+curl -fsSL https://raw.githubusercontent.com/jlcampana/emu.compress.roms/main/install.sh | bash -s -- --with-dolphin
+
+# Sin preguntar, en /usr/local/bin y sin tocar paquetes del sistema
+curl -fsSL .../install.sh | bash -s -- --yes --system --no-deps
+
+# Desinstalar (no quita las dependencias)
+curl -fsSL .../install.sh | bash -s -- --uninstall
+```
+
+Otras: `--bin-dir DIR`, `--ref RAMA` y `--help`. Desde un clon del
+repositorio, `./install.sh` copia el script local en vez de descargarlo.
+
 ## Formatos
 
 | Formato | Uso | Herramienta |
@@ -94,7 +127,7 @@ emu-compress compress ~/roms/PS2 --system ps2
 
 ## Dependencias
 
-En Fedora:
+El instalador se encarga de las básicas. Para instalarlas a mano, en Fedora:
 
 ```bash
 sudo dnf install mame-tools 7zip
@@ -103,12 +136,14 @@ sudo dnf install mame-tools 7zip
 En Ubuntu/Debian:
 
 ```bash
-sudo apt install mame-tools p7zip-full
+sudo apt install mame-tools 7zip    # p7zip-full en versiones antiguas
 ```
 
 Además hacen falta, según los formatos que se vayan a usar:
 
-- `dolphin-tool` (paquete Dolphin o Flatpak `org.DolphinEmu.dolphin-emu`). Con
+- `dolphin-tool` (paquete `dolphin-emu-tool` en Fedora o Flatpak
+  `org.DolphinEmu.dolphin-emu`; el paquete `dolphin-emu` de Ubuntu/Debian no
+  lo incluye). Con
   Flatpak, el script concede acceso a la carpeta de cada juego con
   `--filesystem`, así que funciona también fuera de `/home` y `/run/media`.
 - `maxcso` o `ciso` para CSO.

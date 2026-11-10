@@ -54,8 +54,6 @@ Referencia visual de formatos: `image.png`.
 3. Decidir si se soportan `.nds`/`.cia` (ahora se omiten; EmuDeck tampoco los
    soporta) y `.cdi` de Dreamcast (ahora se omite).
 4. Valorar si se añaden `.d88`/`.hdf`/`.xdf` de X68000 (ahora se omiten).
-5. Queda una rama remota `develop` sobrante (ver §3); el usuario decide si
-   borrarla.
 
 ## 3. Archivos del repositorio
 
@@ -72,10 +70,8 @@ Referencia visual de formatos: `image.png`.
 Git:
 
 - Remoto: `https://github.com/jlcampana/emu.compress.roms` (público).
-- Rama de trabajo y por defecto en GitHub: **`main`**. El usuario renombró
-  `develop` → `main` en GitHub. Un push accidental volvió a crear `develop` en
-  el remoto (mismo commit que `main`); no se borró porque el clasificador
-  bloqueó borrar ramas remotas. Trabajar siempre en `main`.
+- Rama de trabajo y por defecto en GitHub: **`main`** (el usuario renombró
+  `develop` → `main`; ya no existe `develop`). Trabajar siempre en `main`.
 - El usuario quiere **commit + push en cada pequeño hito**.
 
 ## 4. Rutas reales importantes

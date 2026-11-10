@@ -54,6 +54,18 @@ Extensiones que se meten en 7z: `nes`, `fds`, `sfc`, `smc`, `gb`, `gbc`,
 también se comprimen, pero nunca los archivos de `bios/` ni las pistas de un
 `.cue`/`.gdi`.
 
+Los disquetes de X68000 (`d88`, `88d`, `dim`, `hdm`, `2hd`, `xdf`, `dup`)
+también van a 7z, pero solo si la carpeta es de X68000 (`x68000`, `x68k`...):
+`.d88` y `.dim` los usan también PC-88 y PC-98. Los discos duros `.hdf` no se
+tocan, porque el emulador escribe en ellos.
+
+No se convierten: `.nds`, `.cia`, `.cdi` (Dreamcast) ni `.hdf`.
+
+Juegos multidisco con `.m3u`: los discos que lista un `.m3u` no se meten en
+7z (la lista dejaría de funcionar). Los `.cue`/`.gdi` sí pasan a CHD, y con
+`--delete` el `.m3u` se actualiza para apuntar al `.chd` (y al revés al
+descomprimir).
+
 ## Uso
 
 ```bash
@@ -168,3 +180,6 @@ Excepciones a tener en cuenta:
 - Las pistas de un `.cue`/`.gdi`/`.toc` solo se borran con `--delete` y solo
   si están en la misma carpeta que el descriptor.
 - Los `.iso` de `xbox360` se omiten para no confundirlos con Xbox clásico.
+- Con `--delete`, los `.m3u` de la carpeta se reescriben para que apunten al
+  archivo nuevo (`Juego (Disc 1).cue` → `Juego (Disc 1).chd`). Sin
+  `--delete` no se modifican, porque el original sigue existiendo.

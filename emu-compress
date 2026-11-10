@@ -409,6 +409,8 @@ normalize_system() {
             printf 'tg-cd\n' ;;
         neogeocd|neogeocdjp)
             printf '%s\n' "$key" ;;
+        x68000|x68k|sharpx68000|sharpx68k)
+            printf 'x68000\n' ;;
         *)
             printf '%s\n' "$key" ;;
     esac
@@ -416,7 +418,7 @@ normalize_system() {
 
 is_known_system() {
     case "$1" in
-        psp|gc|wii|primehacks|xbox|xbox360|ps2|n3ds|msx) return 0 ;;
+        psp|gc|wii|primehacks|xbox|xbox360|ps2|n3ds|msx|x68000) return 0 ;;
     esac
     is_cd_system "$1" || is_cart_system "$1"
 }
@@ -441,6 +443,17 @@ is_7z_ext() {
         ngp|ngc|a26|lnx|ws|pc2|wsc|n64|ndd|v64|z64|gb|dmg|gba|gbc|nes|fds|\
         unf|unif|bs|fig|sfc|smc|swx|32x|gg|gen|md|smd|pce|sgx)
             return 0 ;;
+    esac
+    return 1
+}
+
+# Imágenes de disquete de X68000. .d88 y .dim también los usan PC-88/PC-98,
+# así que solo se comprimen si el sistema es x68000. Los discos duros (.hdf)
+# no se tocan: el emulador escribe en ellos y dentro de un 7z se perderían
+# los cambios.
+is_x68k_floppy_ext() {
+    case "$1" in
+        d88|88d|dim|hdm|2hd|xdf|dup) return 0 ;;
     esac
     return 1
 }
@@ -562,7 +575,7 @@ classify_compress() {
             min=65536
             [[ "$ext" == "rom" || "$ext" == "dsk" ]] && min=16384
             if is_cart_system "$hint" && (( $(size_of "$f") >= min )); then
-                printf '7z\n'
+                emit_7z_or_skip "$f"
             else
                 printf 'skip\n'
             fi
@@ -621,7 +634,10 @@ classify_compress() {
             ;;
         *)
             if is_7z_ext "$ext"; then
-                printf '7z\n'
+                emit_7z_or_skip "$f"
+            elif is_x68k_floppy_ext "$ext" \
+                && [[ "$(system_hint "$f" || true)" == x68000 ]]; then
+                emit_7z_or_skip "$f"
             else
                 printf 'skip\n'
             fi
@@ -688,6 +704,79 @@ is_track_file() {
                 \( -iname '*.cue' -o -iname '*.gdi' -o -iname '*.toc' \) \
                 -print0 2>/dev/null)
     return 1
+}
+
+# ¿El archivo aparece en algún .m3u de su carpeta? Los juegos multidisco
+# (MSX, X68000...) se cargan desde la lista por nombre: si un disco se mete
+# en un 7z, el .m3u deja de funcionar. Se cachea por carpeta.
+declare -A M3U_CACHE=()
+# Carga los nombres listados en los .m3u de una carpeta. Se llama desde el
+# proceso principal antes de clasificar, porque la clasificación corre en
+# un subproceso y no podría guardar la caché.
+m3u_load_dir() {
+    local dir=$1 names line m
+    [[ -n "${M3U_CACHE[$dir]+x}" ]] && return 0
+    names=$'\n'
+    while IFS= read -r -d '' m; do
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            line=${line%$'\r'}
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            line=${line//\\//}
+            names+="${line##*/}"$'\n'
+        done < "$m"
+    done < <(find "$dir" -maxdepth 1 -type f -iname '*.m3u' -print0 2>/dev/null)
+    M3U_CACHE[$dir]=$names
+}
+
+is_m3u_entry() {
+    local f=$1 dir
+    dir=${f%/*}
+    m3u_load_dir "$dir"
+    [[ "${M3U_CACHE[$dir]}" == *$'\n'"${f##*/}"$'\n'* ]]
+}
+
+# Con --delete, tras convertir: en los .m3u de la carpeta del original,
+# cambia la entrada "viejo.cue" por "nuevo.chd" (o al revés al descomprimir)
+# para que la lista siga funcionando. Conserva rutas relativas y CRLF.
+m3u_retarget() {
+    local old=$1 new=$2 dir m tmp
+    (( DELETE )) || return 0
+    (( DRY_RUN )) && return 0
+    [[ -n "$new" ]] || return 0
+    dir=${old%/*}
+    while IFS= read -r -d '' m; do
+        tmp="$m.emu-compress.tmp"
+        if OLD_NAME=${old##*/} NEW_NAME=${new##*/} awk '
+            BEGIN { o = ENVIRON["OLD_NAME"]; n = ENVIRON["NEW_NAME"]; changed = 0 }
+            {
+                line = $0; cr = ""
+                if (sub(/\r$/, "", line)) cr = "\r"
+                base = line; sub(/.*[\/\\]/, "", base)
+                if (line !~ /^#/ && base == o) {
+                    line = substr(line, 1, length(line) - length(o)) n
+                    changed = 1
+                }
+                print line cr
+            }
+            END { exit changed ? 0 : 3 }
+        ' "$m" > "$tmp"; then
+            cat -- "$tmp" > "$m" && rm -f -- "$tmp"
+            unset 'M3U_CACHE[$dir]'
+            info "  actualizado $m: ${old##*/} -> ${new##*/}"
+        else
+            rm -f -- "$tmp"
+        fi
+    done < <(find "$dir" -maxdepth 1 -type f -iname '*.m3u' -print0 2>/dev/null)
+    return 0
+}
+
+# 7z salvo que el archivo sea un disco listado en un .m3u.
+emit_7z_or_skip() {
+    if is_m3u_entry "$1"; then
+        printf 'skip\n'
+    else
+        printf '7z\n'
+    fi
 }
 
 # Tamaño "real" de la entrada: para cue/gdi/toc suma sus pistas.
@@ -1046,6 +1135,7 @@ process_compress() {
         return 2
     fi
 
+    m3u_load_dir "${f%/*}"
     action=$(classify_compress "$f")
     [[ "$action" == "skip" ]] && return 2
 
@@ -1147,6 +1237,7 @@ process_compress() {
         chd_cd) delete_payload "$f" ;;
         *)      delete_input "$f" ;;
     esac
+    [[ "$action" != 7z ]] && m3u_retarget "$f" "$out"
 
     info "         $(human "$before") -> $(human "$after")  (ahorro $(pct_saved "$before" "$after"))"
     return 0
@@ -1227,6 +1318,7 @@ process_decompress() {
     LAST_BEFORE=$before
     LAST_AFTER=$after
     delete_input "$f"
+    [[ "$action" != 7z ]] && m3u_retarget "$f" "$out"
     if [[ -n "$out" && "$action" != "7z" ]]; then
         info "         $(human "$before") -> $(human "$after")"
     fi

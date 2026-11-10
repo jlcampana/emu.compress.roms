@@ -1,0 +1,1316 @@
+#!/usr/bin/env bash
+#
+# emu-compress - Comprime y descomprime ROMs/ISOs de emuladores.
+#
+# Replica el "Bulk Compression" y "Bulk Decompression" de EmuDeck, pero
+# trabajando sobre el directorio actual (o el que se indique) en lugar de
+# rutas fijas.
+#
+# Formatos soportados:
+#   - CHD  (CD: cue/gdi/toc/iso, DVD: iso)      -> chdman
+#   - RVZ  (GameCube / Wii: iso, gcm)            -> dolphin-tool
+#   - CSO  (PSP: iso)                            -> maxcso o ciso
+#   - 3DS recortado (3ds)                        -> 3dstool
+#   - XISO (Xbox: iso)                           -> extract-xiso
+#   - 7z   (ROMs de sistemas RetroArch)          -> 7z
+#
+# Por seguridad, los originales se conservan salvo que se use --delete.
+#
+# Uso:
+#   emu-compress [opciones] [compress|decompress|list] [ruta]
+#
+# Ejemplos:
+#   emu-compress compress                 # comprime el directorio actual
+#   emu-compress compress ~/roms/psx -d   # comprime y borra originales
+#   emu-compress decompress ~/roms/psp
+#   emu-compress list ~/roms              # solo muestra lo que haría
+#
+set -uo pipefail
+
+VERSION="0.1.0"
+PROG="${0##*/}"
+
+# ---------------------------------------------------------------------------
+# Valores por defecto
+# ---------------------------------------------------------------------------
+COMMAND="compress"
+ROOT="."
+DRY_RUN=0
+DELETE=0
+FORCE=0
+RECURSIVE=1
+ASSUME_YES=0
+QUIET=0
+VERBOSE=0
+VERIFY=0
+PSP_FORMAT="cso"          # cso | chd
+CHD_DVD_CODEC="zstd"      # vacío = códec por defecto de chdman
+CHD_CD_CODEC=""           # vacío = códec por defecto de chdman
+CD_FORMAT="cue"           # cue | gdi (para descomprimir CHD de CD)
+SEVENZIP_LEVEL=9
+LOG_FILE=""
+SYSTEM_OVERRIDE=""        # fuerza el sistema para todos los archivos
+ROOT_SET=0
+
+# ---------------------------------------------------------------------------
+# Utilidades de salida
+# ---------------------------------------------------------------------------
+info()  { (( QUIET )) || printf '%s\n' "$*"; }
+warn()  { printf 'aviso: %s\n' "$*" >&2; }
+err()   { printf 'error: %s\n' "$*" >&2; }
+die()   { err "$*"; exit 1; }
+
+usage() {
+    cat <<EOF
+$PROG $VERSION - Compresor/descompresor de ROMs e ISOs para emuladores
+
+USO
+  $PROG [opciones] [compress|decompress|list] [ruta]
+
+COMANDOS
+  compress      Comprime los archivos compatibles (por defecto)
+  decompress    Descomprime CHD, CSO, RVZ y 7z
+  list          Muestra qué se comprimiría, sin tocar nada
+
+OPCIONES
+  -n, --dry-run          No modifica nada; solo muestra las acciones
+  -d, --delete           Borra los originales tras una conversión correcta
+  -k, --keep             Conserva los originales (por defecto)
+  -f, --force            Sobrescribe archivos de salida existentes
+  -r, --recursive        Busca también en subdirectorios (por defecto)
+      --no-recursive     Solo el directorio indicado
+  -y, --yes              No pide confirmación (útil con --delete)
+  -q, --quiet            Solo muestra errores y el resumen
+  -v, --verbose          Muestra los comandos que se ejecutan
+      --verify           Verifica la salida (CHD, 7z y CRC32 de RVZ)
+      --system SISTEMA   Fuerza el sistema para todos los archivos
+                         (ps2, psx, psp, gc, wii, xbox, xbox360, saturn,
+                         dreamcast, msx...)
+      --psp-format FMT   Formato para ISOs de PSP: cso (defecto) o chd
+      --cd-format FMT    Formato al extraer CHD de CD: cue (defecto) o gdi
+      --chd-dvd-codec C  Códec para CHD DVD (defecto: zstd; "" = automático)
+      --chd-cd-codec C   Códec para CHD CD (defecto: automático)
+      --7z-level N       Nivel de compresión 7z, 0-9 (defecto: 9)
+      --log ARCHIVO      Guarda también la salida en ARCHIVO
+  -h, --help             Muestra esta ayuda
+      --version          Muestra la versión
+
+DETECCIÓN
+  Si el directorio actual se llama como un sistema (ps2, psp, gc, wii, psx,
+  saturn...), se asume ese sistema para todos los archivos, incluidos los
+  subdirectorios. También se reconocen variantes como dreamcast.gdemu,
+  msx.all, pcenginecd.check o 3ds-nds. Si no, se mira el contenido real de
+  los .iso (GameCube, Wii, Xbox, PSP, PS2) y después los nombres de las
+  carpetas intermedias y padre. Como último recurso se usa el tamaño:
+  >= 700 MiB se trata como DVD y el resto como CD.
+
+  Las pistas de un .cue/.gdi/.toc no se tocan por separado, los .iso de
+  xbox360 se omiten y nunca se modifica nada dentro de bios/ ni bios-lakka/.
+
+DEPENDENCIAS
+  chdman (mame-tools), 7z, maxcso o ciso, dolphin-tool, 3dstool, extract-xiso.
+  Si existen, también se usan las herramientas incluidas en EmuDeck.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argumentos
+# ---------------------------------------------------------------------------
+while (( $# )); do
+    # Opciones que necesitan un valor.
+    case "$1" in
+        --psp-format|--cd-format|--chd-dvd-codec|--chd-cd-codec|\
+        --7z-level|--system|--log)
+            (( $# >= 2 )) || die "falta valor para $1"
+            ;;
+    esac
+    case "$1" in
+        compress|decompress|list)
+            COMMAND="$1"; shift ;;
+        -n|--dry-run)   DRY_RUN=1; shift ;;
+        -d|--delete)    DELETE=1; shift ;;
+        -k|--keep)      DELETE=0; shift ;;
+        -f|--force)     FORCE=1; shift ;;
+        -r|--recursive) RECURSIVE=1; shift ;;
+        --no-recursive) RECURSIVE=0; shift ;;
+        -y|--yes)       ASSUME_YES=1; shift ;;
+        -q|--quiet)     QUIET=1; shift ;;
+        -v|--verbose)   VERBOSE=1; shift ;;
+        --verify)       VERIFY=1; shift ;;
+        --psp-format)   PSP_FORMAT="${2:-}"; shift 2 ;;
+        --psp-format=*) PSP_FORMAT="${1#*=}"; shift ;;
+        --cd-format)    CD_FORMAT="${2:-}"; shift 2 ;;
+        --cd-format=*)  CD_FORMAT="${1#*=}"; shift ;;
+        --chd-dvd-codec)   CHD_DVD_CODEC="${2:-}"; shift 2 ;;
+        --chd-dvd-codec=*) CHD_DVD_CODEC="${1#*=}"; shift ;;
+        --chd-cd-codec)    CHD_CD_CODEC="${2:-}"; shift 2 ;;
+        --chd-cd-codec=*)  CHD_CD_CODEC="${1#*=}"; shift ;;
+        --7z-level)     SEVENZIP_LEVEL="${2:-}"; shift 2 ;;
+        --7z-level=*)   SEVENZIP_LEVEL="${1#*=}"; shift ;;
+        --system)       SYSTEM_OVERRIDE="${2:-}"; shift 2 ;;
+        --system=*)     SYSTEM_OVERRIDE="${1#*=}"; shift ;;
+        --log)          LOG_FILE="${2:-}"; shift 2 ;;
+        --log=*)        LOG_FILE="${1#*=}"; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        --version)      printf '%s %s\n' "$PROG" "$VERSION"; exit 0 ;;
+        --)
+            shift
+            while (( $# )); do
+                (( ROOT_SET )) && die "solo se admite una ruta"
+                ROOT="$1"; ROOT_SET=1; shift
+            done
+            ;;
+        -*) die "opción desconocida: $1 (usa --help)" ;;
+        *)
+            (( ROOT_SET )) && die "solo se admite una ruta"
+            ROOT="$1"; ROOT_SET=1; shift
+            ;;
+    esac
+done
+
+case "$PSP_FORMAT" in cso|chd) ;; *) die "--psp-format debe ser cso o chd" ;; esac
+case "$CD_FORMAT" in cue|gdi) ;; *) die "--cd-format debe ser cue o gdi" ;; esac
+[[ "$SEVENZIP_LEVEL" =~ ^[0-9]$ ]] || die "--7z-level debe estar entre 0 y 9"
+
+# "list" es un dry-run de compresión.
+[[ "$COMMAND" == "list" ]] && DRY_RUN=1
+
+[[ -d "$ROOT" ]] || die "no es un directorio: $ROOT"
+ROOT=$(cd -- "$ROOT" && pwd -P)
+
+if [[ -n "$LOG_FILE" ]]; then
+    mkdir -p -- "$(dirname -- "$LOG_FILE")" || die "no se pudo crear el directorio del log"
+    LOG_FILE="$(cd -- "$(dirname -- "$LOG_FILE")" && pwd -P)/$(basename -- "$LOG_FILE")"
+    exec > >(tee -a -- "$LOG_FILE") 2>&1
+fi
+
+# ---------------------------------------------------------------------------
+# Detección de herramientas
+# ---------------------------------------------------------------------------
+EMUDECK_TOOLS="${EMUDECK_TOOLS:-$HOME/.config/EmuDeck/backend/tools/chdconv}"
+
+tool_path() {
+    local name=$1
+    if command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+        return 0
+    fi
+    if [[ -x "$EMUDECK_TOOLS/$name" ]]; then
+        printf '%s\n' "$EMUDECK_TOOLS/$name"
+        return 0
+    fi
+    return 1
+}
+
+CHDMAN=$(tool_path chdman || tool_path chdman5 || true)
+EXISO=$(tool_path extract-xiso || true)
+THREEDSTOOL=$(tool_path 3dstool || true)
+
+CSO_TOOL=""
+CSO_KIND=""
+if command -v maxcso >/dev/null 2>&1; then
+    CSO_TOOL=$(command -v maxcso); CSO_KIND="maxcso"
+elif command -v ciso >/dev/null 2>&1; then
+    CSO_TOOL=$(command -v ciso); CSO_KIND="ciso"
+elif [[ -x "$EMUDECK_TOOLS/ciso" ]]; then
+    CSO_TOOL="$EMUDECK_TOOLS/ciso"; CSO_KIND="ciso"
+fi
+
+DOLPHIN_TOOL=()
+DOLPHIN_FLATPAK=""
+if command -v dolphin-tool >/dev/null 2>&1; then
+    DOLPHIN_TOOL=(dolphin-tool)
+elif command -v flatpak >/dev/null 2>&1; then
+    # Prefiere Dolphin antes que PrimeHack.
+    dolphin_app=$(flatpak list --columns=application 2>/dev/null \
+        | grep -E '^org\.DolphinEmu\.dolphin-emu$' | head -n1 || true)
+    if [[ -z "$dolphin_app" ]]; then
+        dolphin_app=$(flatpak list --columns=application 2>/dev/null \
+            | grep -Ei 'primehack' | head -n1 || true)
+    fi
+    if [[ -n "$dolphin_app" ]]; then
+        DOLPHIN_TOOL=(flatpak run --command=dolphin-tool "$dolphin_app")
+        DOLPHIN_FLATPAK=$dolphin_app
+    fi
+fi
+
+SEVENZIP=""
+for candidate in 7z 7za 7zr; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        SEVENZIP=$(command -v "$candidate")
+        break
+    fi
+done
+
+# ---------------------------------------------------------------------------
+# Utilidades generales
+# ---------------------------------------------------------------------------
+lower_ext() {
+    local f=$1
+    f=${f##*.}
+    printf '%s' "${f,,}"
+}
+
+size_of() {
+    stat -c %s -- "$1" 2>/dev/null || printf '0'
+}
+
+human() {
+    local b=${1:-0}
+    numfmt --to=iec-i --suffix=B "$b" 2>/dev/null || printf '%sB' "$b"
+}
+
+pct_saved() {
+    local before=$1 after=$2
+    if (( before > 0 )); then
+        awk -v b="$before" -v a="$after" 'BEGIN { printf "%.1f%%", (1 - a / b) * 100 }'
+    else
+        printf 'n/a'
+    fi
+}
+
+quote_cmd() {
+    printf '%q ' "$@"
+}
+
+confirm() {
+    (( ASSUME_YES )) && return 0
+    if [[ ! -t 0 ]]; then
+        warn "sin terminal interactiva; usa --yes para confirmar"
+        return 1
+    fi
+    local answer
+    read -r -p "$1 [s/N] " answer
+    [[ "$answer" =~ ^[sSyY]$ ]]
+}
+
+TOOL_LOG=""
+trap '[[ -n "$TOOL_LOG" ]] && rm -f -- "$TOOL_LOG"' EXIT
+TOOL_LOG=$(mktemp "${TMPDIR:-/tmp}/emu-compress.XXXXXX" 2>/dev/null || true)
+
+# Ejecuta un comando. En modo dry-run solo lo muestra. Si no es verbose,
+# captura la salida y solo la imprime cuando el comando falla.
+run_tool() {
+    if (( DRY_RUN )); then
+        info "  [dry-run] $(quote_cmd "$@")"
+        return 0
+    fi
+    if (( VERBOSE )); then
+        "$@"
+        return $?
+    fi
+    if [[ -z "$TOOL_LOG" ]]; then
+        "$@"
+        return $?
+    fi
+    : > "$TOOL_LOG"
+    local rc=0
+    "$@" >"$TOOL_LOG" 2>&1 || rc=$?
+    if (( rc == 0 )); then
+        return 0
+    fi
+    err "falló: $(quote_cmd "$@")"
+    sed 's/^/    /' "$TOOL_LOG" >&2
+    return "$rc"
+}
+
+require_tool() {
+    local value=$1 label=$2
+    if [[ -z "$value" ]]; then
+        err "falta $label"
+        return 1
+    fi
+    return 0
+}
+
+require_dolphin() {
+    if (( ${#DOLPHIN_TOOL[@]} == 0 )); then
+        err "falta dolphin-tool (instala Dolphin o usa su versión Flatpak)"
+        return 1
+    fi
+    return 0
+}
+
+verify_output() {
+    (( VERIFY )) || return 0
+    local kind=$1 file=$2
+    case "$kind" in
+        chd)
+            [[ -n "$CHDMAN" ]] || return 0
+            info "  verificando CHD..."
+            run_tool "$CHDMAN" verify -i "$file" >/dev/null
+            ;;
+        7z)
+            [[ -n "$SEVENZIP" ]] || return 0
+            info "  verificando 7z..."
+            run_tool "$SEVENZIP" t "$file" >/dev/null
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Detección de sistemas y formatos
+# ---------------------------------------------------------------------------
+is_cd_system() {
+    case "$1" in
+        3do|amiga|amiga1200|amiga600|amigacd32|atomiswave|cdimono1|cdtv|dreamcast|\
+        megacd|megacdjp|naomi|naomi2|naomigd|neogeocd|neogeocdjp|pcenginecd|\
+        pcfx|psx|saturn|saturnjp|segacd|tg-cd)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Sistemas de cartucho: sus .bin/.rom/.dsk sueltos se pueden meter en 7z.
+is_cart_system() {
+    case "$1" in
+        a26|a78|gb|gbc|gba|gg|genesis|genesiswide|lnx|md|megadrive|megadrivejp|\
+        msx|msx1|msx2|n64|ndd|nes|ngp|ngc|pc2|pce|pcengine|sega32x|sega32xjp|\
+        sega32xna|sfc|sgx|snes|tg16|v64|ws|wsc|wonderswan|wonderswancolor|z64)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Normaliza nombres habituales de carpetas a los nombres canónicos.
+normalize_system() {
+    local key=${1,,}
+    key=${key//[[:space:]]/}
+    key=${key//_/}
+    key=${key//-/}
+    # Carpetas con variantes: dreamcast.gdemu, msx.all, pcenginecd.check...
+    key=${key%%.*}
+    case "$key" in
+        ps1|psx|playstation|playstation1|sonyplaystation|sonyplaystation1)
+            printf 'psx\n' ;;
+        ps2|playstation2|sonyplaystation2)
+            printf 'ps2\n' ;;
+        psp|playstationportable|sonypsp)
+            printf 'psp\n' ;;
+        gc|ngc|gamecube|nintendogamecube)
+            printf 'gc\n' ;;
+        wii|nintendowii)
+            printf 'wii\n' ;;
+        xbox|microsoftxbox|xboxclassic)
+            printf 'xbox\n' ;;
+        xbox360|microsoftxbox360)
+            printf 'xbox360\n' ;;
+        n3ds|3ds|nintendo3ds|3dsnds|nds3ds)
+            printf 'n3ds\n' ;;
+        saturn|segasaturn)
+            printf 'saturn\n' ;;
+        dreamcast|dc|segadreamcast)
+            printf 'dreamcast\n' ;;
+        megacd|segacd)
+            printf 'megacd\n' ;;
+        tg16|pce|pcengine|turbografx16)
+            printf 'tg16\n' ;;
+        tgcd|turbografxcd|turbografx16cd)
+            printf 'tg-cd\n' ;;
+        neogeocd|neogeocdjp)
+            printf '%s\n' "$key" ;;
+        *)
+            printf '%s\n' "$key" ;;
+    esac
+}
+
+is_known_system() {
+    case "$1" in
+        psp|gc|wii|primehacks|xbox|xbox360|ps2|n3ds|msx) return 0 ;;
+    esac
+    is_cd_system "$1" || is_cart_system "$1"
+}
+
+# Rutas que nunca se deben tocar (BIOS y similares).
+is_excluded_path() {
+    local lower=${1,,}
+    case "/$lower/" in
+        */bios/*|*/bios-lakka/*|*/bios_lakka/*) return 0 ;;
+    esac
+    return 1
+}
+
+if [[ -n "$SYSTEM_OVERRIDE" ]]; then
+    SYSTEM_OVERRIDE=$(normalize_system "$SYSTEM_OVERRIDE")
+    is_known_system "$SYSTEM_OVERRIDE" \
+        || die "--system no reconocido: $SYSTEM_OVERRIDE"
+fi
+
+is_7z_ext() {
+    case "$1" in
+        ngp|ngc|a26|lnx|ws|pc2|wsc|n64|ndd|v64|z64|gb|dmg|gba|gbc|nes|fds|\
+        unf|unif|bs|fig|sfc|smc|swx|32x|gg|gen|md|smd|pce|sgx)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Pista de sistema. Prioridad:
+#   1. --system
+#   2. nombre del directorio actual (se asume que todo lo de dentro es de
+#      ese sistema, incluidos los subdirectorios)
+#   3. nombre de alguna carpeta intermedia (útil si se ejecuta en ~/roms)
+# Ej: ~/roms/ps2/juego.iso -> "ps2".
+system_hint() {
+    local f=$1 rel comp base
+    local -a parts=()
+
+    if [[ -n "$SYSTEM_OVERRIDE" ]]; then
+        printf '%s\n' "$SYSTEM_OVERRIDE"
+        return 0
+    fi
+
+    base=$(normalize_system "$(basename -- "$ROOT")")
+    if is_known_system "$base"; then
+        printf '%s\n' "$base"
+        return 0
+    fi
+
+    rel=${f#"$ROOT"/}
+    IFS='/' read -r -a parts <<< "$rel"
+    local i
+    for (( i = 0; i < ${#parts[@]} - 1; i++ )); do
+        comp=$(normalize_system "${parts[$i]}")
+        if is_known_system "$comp"; then
+            printf '%s\n' "$comp"
+            return 0
+        fi
+    done
+
+    # Si estamos en una subcarpeta profunda (p. ej. MegaCD/oth/USA), mira
+    # también los nombres de las carpetas padre.
+    local dir depth=0
+    dir=$(dirname -- "$ROOT")
+    while [[ "$dir" != "/" && "$dir" != "." ]] && (( depth < 3 )); do
+        comp=$(normalize_system "$(basename -- "$dir")")
+        if is_known_system "$comp"; then
+            printf '%s\n' "$comp"
+            return 0
+        fi
+        dir=$(dirname -- "$dir")
+        (( depth++ ))
+    done
+
+    return 1
+}
+
+# Detecta el tipo real de una imagen ISO leyendo su cabecera.
+iso_kind() {
+    local f=$1 magic
+
+    # Xbox: "MICROSOFT*XBOX*MEDIA" en el sector 32 (offset 0x10000)
+    if dd if="$f" bs=32 skip=2048 count=1 status=none 2>/dev/null \
+        | grep -qa "MICROSOFT"; then
+        printf 'xbox\n'; return 0
+    fi
+
+    # GameCube: magic 0xC2339F3D en offset 0x1C
+    magic=$(od -An -tx1 -j 28 -N 4 -- "$f" 2>/dev/null | tr -d ' \n')
+    if [[ "$magic" == "c2339f3d" ]]; then
+        printf 'gc\n'; return 0
+    fi
+
+    # Wii: magic 0x5D1C9EA3 en offset 0x18
+    magic=$(od -An -tx1 -j 24 -N 4 -- "$f" 2>/dev/null | tr -d ' \n')
+    if [[ "$magic" == "5d1c9ea3" ]]; then
+        printf 'wii\n'; return 0
+    fi
+
+    # PSP: el directorio raíz contiene PSP_GAME
+    if head -c 33554432 -- "$f" 2>/dev/null | grep -qa "PSP_GAME"; then
+        printf 'psp\n'; return 0
+    fi
+
+    # PS2: SYSTEM.CNF contiene BOOT2
+    if head -c 33554432 -- "$f" 2>/dev/null | grep -qa "BOOT2"; then
+        printf 'ps2\n'; return 0
+    fi
+
+    printf 'unknown\n'
+}
+
+# Devuelve la acción de compresión para un archivo.
+classify_compress() {
+    local f=$1 ext hint kind min
+
+    # BIOS y similares: nunca se tocan.
+    if is_excluded_path "$f"; then
+        printf 'skip\n'; return 0
+    fi
+
+    ext=$(lower_ext "$f")
+
+    # Las pistas de un .cue/.gdi/.toc se convierten junto con el descriptor,
+    # no por separado (importante en dreamcast.gdemu: track01.iso, etc.).
+    # Solo se comprueba en extensiones que pueden ser pistas.
+    case "$ext" in
+        bin|iso|raw|img|wav|mp3|flac|ogg|ape)
+            if is_track_file "$f"; then
+                printf 'skip\n'; return 0
+            fi
+            ;;
+    esac
+
+    case "$ext" in
+        cue|gdi|toc) printf 'chd_cd\n'; return 0 ;;
+        gcm|wbfs)    printf 'rvz\n';    return 0 ;;
+        3ds|cci)     printf 'trim3ds\n'; return 0 ;;
+        bin|rom|dsk)
+            # Solo ROMs sueltas de sistemas de cartucho, y nunca BIOS
+            # pequeñas (FDSBIOS.bin, boot0.rom...).
+            hint=$(system_hint "$f" || true)
+            min=65536
+            [[ "$ext" == "rom" || "$ext" == "dsk" ]] && min=16384
+            if is_cart_system "$hint" && (( $(size_of "$f") >= min )); then
+                printf '7z\n'
+            else
+                printf 'skip\n'
+            fi
+            return 0
+            ;;
+        iso)
+            # Si hay un .cue/.gdi hermano, ese archivo manda.
+            local base=${f%.*}
+            local sibling
+            for sibling in "$base".cue "$base".gdi "$base".toc \
+                           "$base".CUE "$base".GDI "$base".TOC; do
+                if [[ -e "$sibling" ]]; then
+                    printf 'skip\n'
+                    return 0
+                fi
+            done
+
+            # Si el directorio actual (o --system) dice el sistema, se
+            # asume para todo lo que haya debajo.
+            hint=$(system_hint "$f" || true)
+            case "$hint" in
+                psp)                    printf 'psp\n';     return 0 ;;
+                gc|wii|primehacks)      printf 'rvz\n';     return 0 ;;
+                xbox)                   printf 'xiso\n';    return 0 ;;
+                xbox360)                printf 'skip\n';    return 0 ;;
+                ps2)                    printf 'chd_dvd\n'; return 0 ;;
+                *)
+                    if is_cd_system "$hint"; then
+                        printf 'chd_cd\n'; return 0
+                    fi
+                    ;;
+            esac
+
+            # Sin pista de carpeta y con más de 7 GiB: casi seguro que es
+            # una imagen de Xbox 360 (DVD9). No se toca.
+            if [[ -z "$hint" ]] && (( $(size_of "$f") >= 7516192768 )); then
+                printf 'skip\n'; return 0
+            fi
+
+            # Sin pista de carpeta: se mira el contenido real.
+            kind=$(iso_kind "$f")
+            case "$kind" in
+                xbox) printf 'xiso\n';    return 0 ;;
+                gc|wii) printf 'rvz\n';   return 0 ;;
+                psp)  printf 'psp\n';     return 0 ;;
+                ps2)  printf 'chd_dvd\n'; return 0 ;;
+            esac
+
+            # Sin más pistas: por tamaño.
+            if (( $(size_of "$f") >= 734003200 )); then
+                printf 'chd_dvd\n'
+            else
+                printf 'chd_cd\n'
+            fi
+            return 0
+            ;;
+        *)
+            if is_7z_ext "$ext"; then
+                printf '7z\n'
+            else
+                printf 'skip\n'
+            fi
+            return 0
+            ;;
+    esac
+}
+
+# Devuelve la acción de descompresión para un archivo.
+classify_decompress() {
+    local f=$1 ext
+    ext=$(lower_ext "$f")
+    case "$f" in
+        *.xiso.iso|*.XISO.ISO) printf 'xiso_noop\n'; return 0 ;;
+    esac
+    case "$ext" in
+        chd) printf 'chd\n' ;;
+        cso) printf 'cso\n' ;;
+        rvz) printf 'rvz\n' ;;
+        7z)  printf '7z\n' ;;
+        3ds) printf 'trimmed_noop\n' ;;
+        *)   printf 'skip\n' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Archivos auxiliares (cue/gdi/toc)
+# ---------------------------------------------------------------------------
+# Imprime los nombres de archivo referenciados por un .cue/.gdi/.toc.
+payload_files() {
+    local f=$1 ext
+    ext=$(lower_ext "$f")
+    case "$ext" in
+        cue|toc)
+            sed -n \
+                -e 's/^[[:space:]]*FILE[[:space:]]\+"\([^"]*\)".*/\1/Ip' \
+                -e 's/^[[:space:]]*FILE[[:space:]]\+\([^"[:space:]]*\).*/\1/Ip' \
+                -- "$f"
+            ;;
+        gdi)
+            awk '
+                /^[[:space:]]*[0-9]+[[:space:]]/ {
+                    name = $5
+                    gsub(/"/, "", name)
+                    if (name != "") print name
+                }
+            ' "$f"
+            ;;
+    esac
+}
+
+# ¿El archivo es una pista referenciada por algún .cue/.gdi/.toc de su misma
+# carpeta? Sirve para no comprimir las pistas sueltas de dreamcast.gdemu, etc.
+is_track_file() {
+    local f=$1 dir base name c
+    dir=$(dirname -- "$f")
+    base=$(basename -- "$f")
+    while IFS= read -r -d '' c; do
+        while IFS= read -r name; do
+            [[ -z "$name" ]] && continue
+            [[ "${name##*/}" == "$base" ]] && return 0
+        done < <(payload_files "$c")
+    done < <(find "$dir" -maxdepth 1 -type f \
+                \( -iname '*.cue' -o -iname '*.gdi' -o -iname '*.toc' \) \
+                -print0 2>/dev/null)
+    return 1
+}
+
+# Tamaño "real" de la entrada: para cue/gdi/toc suma sus pistas.
+payload_size() {
+    local f=$1 ext total=0 name s target dir
+    ext=$(lower_ext "$f")
+    dir=$(dirname -- "$f")
+    case "$ext" in
+        cue|gdi|toc)
+            while IFS= read -r name; do
+                [[ -z "$name" ]] && continue
+                if [[ "$name" == /* ]]; then
+                    target=$name
+                else
+                    target="$dir/$name"
+                fi
+                s=$(size_of "$target")
+                total=$(( total + s ))
+            done < <(payload_files "$f")
+            if (( total > 0 )); then
+                printf '%s\n' "$total"
+                return 0
+            fi
+            ;;
+    esac
+    size_of "$f"
+}
+
+delete_input() {
+    local f=$1
+    (( DELETE )) || return 0
+    if (( DRY_RUN )); then
+        info "  [dry-run] rm -f -- $(printf '%q' "$f")"
+        return 0
+    fi
+    rm -f -- "$f"
+    info "  original eliminado: $f"
+}
+
+# Borra el .cue/.gdi/.toc y las pistas que referencia (solo mismo directorio).
+delete_payload() {
+    local f=$1 name target dir
+    (( DELETE )) || return 0
+    dir=$(dirname -- "$f")
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        if [[ "$name" == /* ]]; then
+            target=$name
+        else
+            target="$dir/$name"
+        fi
+        # Solo borra pistas que estén directamente en el directorio del
+        # .cue/.gdi/.toc; no toca rutas con subdirectorios ni externas.
+        if [[ "$(dirname -- "$target")" == "$dir" && -f "$target" ]]; then
+            delete_input "$target"
+        fi
+    done < <(payload_files "$f")
+    delete_input "$f"
+}
+
+# ---------------------------------------------------------------------------
+# Operaciones de compresión
+# ---------------------------------------------------------------------------
+remove_output_for_force() {
+    local out=$1
+    (( FORCE )) || return 0
+    (( DRY_RUN )) && return 0
+    [[ -e "$out" ]] && rm -f -- "$out"
+    return 0
+}
+
+compress_chd_cd() {
+    local in=$1 out=$2
+    require_tool "$CHDMAN" "chdman" || return 1
+    remove_output_for_force "$out"
+    local args=(createcd -i "$in" -o "$out")
+    [[ -n "$CHD_CD_CODEC" ]] && args+=(-c "$CHD_CD_CODEC")
+    run_tool "$CHDMAN" "${args[@]}" || return 1
+    verify_output chd "$out" || return 1
+    return 0
+}
+
+compress_chd_dvd() {
+    local in=$1 out=$2 hunksize=${3:-}
+    require_tool "$CHDMAN" "chdman" || return 1
+    remove_output_for_force "$out"
+
+    local base=(createdvd)
+    [[ -n "$hunksize" ]] && base+=(--hunksize "$hunksize")
+    base+=(-i "$in" -o "$out")
+
+    local args=("${base[@]}")
+    [[ -n "$CHD_DVD_CODEC" ]] && args+=(-c "$CHD_DVD_CODEC")
+
+    if run_tool "$CHDMAN" "${args[@]}"; then
+        verify_output chd "$out" || return 1
+        return 0
+    fi
+
+    # Puede que este chdman no soporte el códec pedido.
+    if [[ -n "$CHD_DVD_CODEC" ]]; then
+        warn "reintentando sin el códec '$CHD_DVD_CODEC'"
+        (( DRY_RUN )) || rm -f -- "$out"
+        run_tool "$CHDMAN" "${base[@]}" || return 1
+        verify_output chd "$out" || return 1
+        return 0
+    fi
+    return 1
+}
+
+compress_cso() {
+    local in=$1 out=$2
+    require_tool "$CSO_TOOL" "maxcso o ciso" || return 1
+    remove_output_for_force "$out"
+    if [[ "$CSO_KIND" == "maxcso" ]]; then
+        run_tool "$CSO_TOOL" "$in" -o "$out" || return 1
+    else
+        run_tool "$CSO_TOOL" 9 "$in" "$out" || return 1
+    fi
+    return 0
+}
+
+# Ejecuta dolphin-tool. Si es Flatpak, concede acceso explícito a los
+# directorios de entrada y salida: el sandbox no ve /tmp ni rutas no
+# concedidas aunque la app tenga "filesystem=host".
+# Uso: run_dolphin ENTRADA SALIDA ARGS...
+run_dolphin() {
+    local in=$1 out=$2; shift 2
+    dolphin_cmd "$in" "$out"
+    run_tool "${DOLPHIN_CMD[@]}" "$@"
+}
+
+# Construye DOLPHIN_CMD con los permisos de Flatpak necesarios para las rutas.
+dolphin_cmd() {
+    DOLPHIN_CMD=("${DOLPHIN_TOOL[@]}")
+    [[ -n "$DOLPHIN_FLATPAK" ]] || return 0
+    local p d
+    local -a grants=()
+    for p in "$@"; do
+        d=$(cd -- "$(dirname -- "$p")" 2>/dev/null && pwd -P) || continue
+        [[ " ${grants[*]} " == *" --filesystem=$d "* ]] && continue
+        grants+=(--filesystem="$d")
+    done
+    DOLPHIN_CMD=(flatpak run "${grants[@]}" --command=dolphin-tool "$DOLPHIN_FLATPAK")
+}
+
+# CRC32 del disco decodificado (vale para iso, gcm, wbfs, rvz...).
+dolphin_crc() {
+    dolphin_cmd "$1"
+    "${DOLPHIN_CMD[@]}" verify -i "$1" -a crc32 2>/dev/null | tail -n1
+}
+
+# Con --verify, comprueba que entrada y salida representan el mismo disco.
+verify_rvz_pair() {
+    (( VERIFY )) || return 0
+    (( DRY_RUN )) && return 0
+    local a=$1 b=$2 ca cb
+    info "  verificando RVZ (CRC32 de entrada y salida)..."
+    ca=$(dolphin_crc "$a"); cb=$(dolphin_crc "$b")
+    if [[ -z "$ca" || "$ca" != "$cb" ]]; then
+        err "  la verificación RVZ falló: ${ca:-?} != ${cb:-?}"
+        return 1
+    fi
+    info "  CRC32 correcto: $ca"
+    return 0
+}
+
+compress_rvz() {
+    local in=$1 out=$2
+    require_dolphin || return 1
+    remove_output_for_force "$out"
+    if run_dolphin "$in" "$out" convert -f rvz -b 131072 -c zstd -l 5 \
+        -i "$in" -o "$out"; then
+        verify_rvz_pair "$in" "$out"
+        return $?
+    fi
+    warn "reintentando RVZ con la configuración por defecto de dolphin-tool"
+    (( DRY_RUN )) || rm -f -- "$out"
+    run_dolphin "$in" "$out" convert -f rvz -b 131072 -i "$in" -o "$out" || return 1
+    verify_rvz_pair "$in" "$out"
+}
+
+compress_7z() {
+    local in=$1 out=$2 dir base
+    require_tool "$SEVENZIP" "7z" || return 1
+    remove_output_for_force "$out"
+    dir=$(dirname -- "$in")
+    base=$(basename -- "$in")
+    case "$out" in
+        /*) ;;
+        *) out="$PWD/$out" ;;
+    esac
+    ( cd -- "$dir" && run_tool "$SEVENZIP" a -t7z -mx="$SEVENZIP_LEVEL" -y "$out" -- "$base" ) || return 1
+    verify_output 7z "$out" || return 1
+    return 0
+}
+
+compress_xiso() {
+    local in=$1 out=$2 dir old
+    require_tool "$EXISO" "extract-xiso" || return 1
+    remove_output_for_force "$out"
+    dir=$(dirname -- "$in")
+    old="$in.old"
+
+    if [[ -e "$old" ]]; then
+        err "ya existe $old; parece de una ejecución anterior"
+        return 1
+    fi
+
+    if ! run_tool "$EXISO" -r "$in" -d "$dir"; then
+        # extract-xiso renombra el original a .old antes de reescribir; si
+        # falla, hay que restaurarlo para no perderlo.
+        if [[ -e "$old" ]]; then
+            [[ -e "$in" ]] && rm -f -- "$in"
+            mv -f -- "$old" "$in" && warn "se restauró el original: $in"
+        fi
+        return 1
+    fi
+
+    if (( DRY_RUN )); then
+        return 0
+    fi
+
+    if [[ -e "$old" ]]; then
+        # extract-xiso renombró el original a .old y escribió el optimizado
+        # en la misma ruta.
+        mv -f -- "$in" "$out" || return 1
+        if (( DELETE )); then
+            rm -f -- "$old"
+            info "  original eliminado: $old"
+        else
+            mv -f -- "$old" "$in" || return 1
+        fi
+    else
+        # Ya estaba optimizado; extract-xiso lo ha dejado intacto.
+        info "  ya estaba optimizado: $in"
+        return 2
+    fi
+    return 0
+}
+
+trim_3ds() {
+    local in=$1 out=$2 ext
+    require_tool "$THREEDSTOOL" "3dstool" || return 1
+    if [[ -z "$out" ]]; then
+        ext=$(lower_ext "$in")
+        out="${in%.*}(Trimmed).${ext}"
+    fi
+    if [[ -e "$out" ]] && (( ! FORCE )); then
+        info "  ya existe: $out"
+        return 2
+    fi
+    (( FORCE )) && remove_output_for_force "$out"
+    run_tool "$THREEDSTOOL" -r -f "$in" || return 1
+    (( DRY_RUN )) && return 0
+    mv -f -- "$in" "$out" || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Operaciones de descompresión
+# ---------------------------------------------------------------------------
+chd_type() {
+    local f=$1 info_out
+    require_tool "$CHDMAN" "chdman" || { printf 'unknown\n'; return 1; }
+    info_out=$("$CHDMAN" info -i "$f" 2>/dev/null) || { printf 'unknown\n'; return 1; }
+    if grep -q "Tag='DVD '" <<< "$info_out"; then
+        printf 'dvd\n'
+    else
+        printf 'cd\n'
+    fi
+}
+
+CHD_KIND=""
+decompress_chd() {
+    local in=$1 kind out
+    require_tool "$CHDMAN" "chdman" || return 1
+    kind=$(chd_type "$in")
+    CHD_KIND="$kind"
+    case "$kind" in
+        dvd)
+            out="${in%.*}.iso"
+            remove_output_for_force "$out"
+            run_tool "$CHDMAN" extractdvd -i "$in" -o "$out" || return 1
+            ;;
+        cd)
+            if [[ "$CD_FORMAT" == "gdi" ]]; then
+                out="${in%.*}.gdi"
+            else
+                out="${in%.*}.cue"
+            fi
+            remove_output_for_force "$out"
+            run_tool "$CHDMAN" extractcd -i "$in" -o "$out" || return 1
+            ;;
+        *)
+            err "no se pudo determinar el tipo de CHD: $in"
+            return 1
+            ;;
+    esac
+    if (( ! DRY_RUN )) && [[ ! -s "$out" ]]; then
+        err "no se generó la salida: $out"
+        return 1
+    fi
+    return 0
+}
+
+decompress_cso() {
+    local in=$1
+    local out="${in%.*}.iso"
+    require_tool "$CSO_TOOL" "maxcso o ciso" || return 1
+    remove_output_for_force "$out"
+    if [[ "$CSO_KIND" == "maxcso" ]]; then
+        run_tool "$CSO_TOOL" --decompress "$in" -o "$out" || return 1
+    else
+        run_tool "$CSO_TOOL" 0 "$in" "$out" || return 1
+    fi
+    return 0
+}
+
+decompress_rvz() {
+    local in=$1
+    local out="${in%.*}.iso"
+    require_dolphin || return 1
+    remove_output_for_force "$out"
+    run_dolphin "$in" "$out" convert -f iso -i "$in" -o "$out" || return 1
+    verify_rvz_pair "$in" "$out"
+}
+
+decompress_7z() {
+    local in=$1
+    require_tool "$SEVENZIP" "7z" || return 1
+    run_tool "$SEVENZIP" x -y -o"$(dirname -- "$in")" "$in" || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Procesamiento de un archivo
+# ---------------------------------------------------------------------------
+LAST_BEFORE=0
+LAST_AFTER=0
+
+# Devuelve 0 = convertido, 2 = omitido, 1 = error.
+process_compress() {
+    local f=$1 ext action out before after
+    ext=$(lower_ext "$f")
+
+    # Ignora restos de extract-xiso y archivos temporales.
+    case "$f" in
+        *.old|*.tmp|*.part) return 2 ;;
+    esac
+    [[ "$f" == "$LOG_FILE" ]] && return 2
+
+    # Un 3DS/CCI ya recortado no se vuelve a recortar.
+    if [[ ( "$ext" == "3ds" || "$ext" == "cci" ) \
+          && "$(basename -- "$f")" == *"(Trimmed)"* ]]; then
+        return 2
+    fi
+
+    action=$(classify_compress "$f")
+    [[ "$action" == "skip" ]] && return 2
+
+    case "$action" in
+        chd_cd)   out="${f%.*}.chd" ;;
+        chd_dvd)  out="${f%.*}.chd" ;;
+        rvz)      out="${f%.*}.rvz" ;;
+        7z)       out="${f%.*}.7z" ;;
+        trim3ds)  out="${f%.*}(Trimmed).$(lower_ext "$f")" ;;
+        psp)
+            if [[ "$PSP_FORMAT" == "chd" ]]; then
+                out="${f%.*}.chd"
+            else
+                out="${f%.*}.cso"
+            fi
+            ;;
+        xiso)     out="${f%.*}.xiso.iso" ;;
+        *)        return 2 ;;
+    esac
+
+    if [[ -e "$out" ]] && (( ! FORCE )); then
+        info "omitido (ya existe): $f"
+        return 2
+    fi
+
+    before=$(payload_size "$f")
+    LAST_BEFORE=$before
+
+    case "$action" in
+        chd_cd)
+            info "CHD CD   $f -> $out"
+            compress_chd_cd "$f" "$out" || return 1
+            ;;
+        chd_dvd)
+            info "CHD DVD  $f -> $out"
+            compress_chd_dvd "$f" "$out" || return 1
+            ;;
+        psp)
+            if [[ "$PSP_FORMAT" == "chd" ]]; then
+                info "CHD PSP  $f -> $out"
+                compress_chd_dvd "$f" "$out" 2048 || return 1
+            else
+                if [[ -z "$CSO_TOOL" ]]; then
+                    warn "no hay maxcso/ciso; usando CHD para PSP"
+                    out="${f%.*}.chd"
+                    if [[ -e "$out" ]] && (( ! FORCE )); then
+                        info "omitido (ya existe): $out"
+                        return 2
+                    fi
+                    info "CHD PSP  $f -> $out"
+                    compress_chd_dvd "$f" "$out" 2048 || return 1
+                else
+                    info "CSO      $f -> $out"
+                    compress_cso "$f" "$out" || return 1
+                fi
+            fi
+            ;;
+        rvz)
+            info "RVZ      $f -> $out"
+            compress_rvz "$f" "$out" || return 1
+            ;;
+        xiso)
+            info "XISO     $f -> $out"
+            compress_xiso "$f" "$out"
+            case $? in
+                0) ;;
+                2) return 2 ;;
+                *) return 1 ;;
+            esac
+            ;;
+        7z)
+            info "7z       $f -> $out"
+            compress_7z "$f" "$out" || return 1
+            ;;
+        trim3ds)
+            info "3DS trim $f -> $out"
+            trim_3ds "$f" "$out"
+            case $? in
+                0) ;;
+                2) return 2 ;;
+                *) return 1 ;;
+            esac
+            ;;
+    esac
+
+    (( DRY_RUN )) && { LAST_AFTER=0; return 0; }
+
+    # Nunca borres el original si la salida no se ha creado bien.
+    if [[ ! -s "$out" ]]; then
+        err "no se generó la salida esperada: $out"
+        return 1
+    fi
+
+    after=$(size_of "$out")
+    LAST_AFTER=$after
+
+    # Borra los originales solo tras una conversión correcta.
+    case "$action" in
+        chd_cd) delete_payload "$f" ;;
+        *)      delete_input "$f" ;;
+    esac
+
+    info "         $(human "$before") -> $(human "$after")  (ahorro $(pct_saved "$before" "$after"))"
+    return 0
+}
+
+# Devuelve 0 = convertido, 2 = omitido, 1 = error.
+process_decompress() {
+    local f=$1 ext action before after out
+    ext=$(lower_ext "$f")
+    action=$(classify_decompress "$f")
+
+    case "$action" in
+        skip) return 2 ;;
+        xiso_noop)
+            info "XISO     $f ya es una imagen ISO válida; no requiere descompresión"
+            return 2
+            ;;
+        trimmed_noop)
+            info "3DS      $f está recortado; no se puede deshacer el recorte"
+            return 2
+            ;;
+    esac
+
+    before=$(size_of "$f")
+
+    case "$action" in
+        chd)
+            info "CHD      $f"
+            decompress_chd "$f" || return 1
+            case "$CHD_KIND" in
+                dvd) out="${f%.*}.iso" ;;
+                cd)  if [[ "$CD_FORMAT" == "gdi" ]]; then out="${f%.*}.gdi"; else out="${f%.*}.cue"; fi ;;
+                *)   out="" ;;
+            esac
+            ;;
+        cso)
+            out="${f%.*}.iso"
+            info "CSO      $f -> $out"
+            decompress_cso "$f" || return 1
+            ;;
+        rvz)
+            out="${f%.*}.iso"
+            info "RVZ      $f -> $out"
+            decompress_rvz "$f" || return 1
+            ;;
+        7z)
+            out=""
+            info "7z       $f -> $(dirname -- "$f")"
+            decompress_7z "$f" || return 1
+            ;;
+    esac
+
+    (( DRY_RUN )) && return 0
+
+    if [[ -n "$out" && ! -s "$out" ]]; then
+        err "no se generó la salida esperada: $out"
+        return 1
+    fi
+
+    after=0
+    case "$action" in
+        chd)
+            case "$CHD_KIND" in
+                cd) after=$(payload_size "$out") ;;
+                *)  after=$(size_of "$out") ;;
+            esac
+            ;;
+        cso|rvz)
+            after=$(size_of "$out")
+            ;;
+        7z)
+            # El tamaño extraído depende del contenido; no lo sumamos.
+            before=0
+            after=0
+            ;;
+    esac
+
+    LAST_BEFORE=$before
+    LAST_AFTER=$after
+    delete_input "$f"
+    if [[ -n "$out" && "$action" != "7z" ]]; then
+        info "         $(human "$before") -> $(human "$after")"
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Programa principal
+# ---------------------------------------------------------------------------
+if (( DELETE && ! DRY_RUN && ! ASSUME_YES )); then
+    confirm "Se eliminarán los originales después de convertir. ¿Continuar?" \
+        || die "cancelado por el usuario"
+fi
+
+info "$PROG $VERSION"
+info "Directorio: $ROOT"
+info "Modo: $COMMAND$( (( DRY_RUN )) && printf ' (dry-run)' )$( (( DELETE )) && printf ' (borrar originales)' )"
+if [[ -n "$SYSTEM_OVERRIDE" ]]; then
+    info "Sistema: $SYSTEM_OVERRIDE (forzado con --system)"
+else
+    root_system=$(normalize_system "$(basename -- "$ROOT")")
+    if is_known_system "$root_system"; then
+        info "Sistema: $root_system (por el directorio actual; se aplica a subdirectorios)"
+    fi
+fi
+info ""
+
+FILES=()
+if (( RECURSIVE )); then
+    mapfile -d '' -t FILES < <(
+        find "$ROOT" -mindepth 1 \( -name '.*' -prune -o -type f -print0 \) | sort -z
+    )
+else
+    mapfile -d '' -t FILES < <(
+        find "$ROOT" -mindepth 1 -maxdepth 1 \( -name '.*' -prune -o -type f -print0 \) | sort -z
+    )
+fi
+
+total=${#FILES[@]}
+converted=0
+skipped=0
+failed=0
+sum_before=0
+sum_after=0
+
+for f in "${FILES[@]}"; do
+    [[ -f "$f" ]] || continue
+    case "$COMMAND" in
+        compress|list)
+            process_compress "$f"
+            ;;
+        decompress)
+            process_decompress "$f"
+            ;;
+    esac
+    rc=$?
+    case $rc in
+        0)
+            (( converted++ ))
+            if (( ! DRY_RUN )); then
+                (( sum_before += LAST_BEFORE ))
+                (( sum_after += LAST_AFTER ))
+            fi
+            ;;
+        2) (( skipped++ )) ;;
+        *) (( failed++ )) ;;
+    esac
+done
+
+info ""
+if [[ "$COMMAND" == "list" ]]; then
+    info "Resumen: $converted se convertirían, $skipped omitidos, $failed errores (de $total archivos)"
+elif (( DRY_RUN )); then
+    info "Resumen: $converted se convertirían, $skipped omitidos, $failed errores (de $total archivos)"
+else
+    info "Resumen: $converted convertidos, $skipped omitidos, $failed errores (de $total archivos)"
+    if (( converted > 0 )); then
+        if [[ "$COMMAND" == "decompress" ]]; then
+            info "Espacio: $(human "$sum_before") -> $(human "$sum_after")"
+        else
+            info "Espacio: $(human "$sum_before") -> $(human "$sum_after")  (ahorro $(pct_saved "$sum_before" "$sum_after"))"
+        fi
+    fi
+fi
+
+(( failed > 0 )) && exit 1
+exit 0

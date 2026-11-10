@@ -51,9 +51,9 @@ Referencia visual de formatos: `image.png`.
 
 1. ~~Instalador `curl ... | bash`~~ — hecho: `install.sh` (ver §12).
 2. ~~Probar RVZ real~~ — hecho (ver §10).
-3. Decidir si se soportan `.nds`/`.cia` (ahora se omiten; EmuDeck tampoco los
-   soporta) y `.cdi` de Dreamcast (ahora se omite).
-4. Valorar si se añaden `.d88`/`.hdf`/`.xdf` de X68000 (ahora se omiten).
+3. ~~Formatos pendientes~~ — decidido con el usuario (2026-11-10):
+   `.nds`/`.cia`/`.cdi` se omiten; disquetes X68000 a 7z; `.hdf` se omite.
+   Ver §7.
 
 ## 3. Archivos del repositorio
 
@@ -76,10 +76,10 @@ Git:
 
 ## 4. Rutas reales importantes
 
-- ROMs reales: `/run/media/pandi/Roms/202611` (~869 GB).
-- Otro árbol real: `/run/media/pandi/Roms/sistemas` (una carpeta por sistema;
-  a veces hay carpetas dentro de carpetas). El disco está al 98 % (~122 GB
-  libres).
+- ROMs reales: `/run/media/pandi/Roms/sistemas` (una carpeta por sistema; a
+  veces hay carpetas dentro de carpetas). Antes se llamaba `202611`; ese
+  nombre ya no existe. El disco está al 98 % (~122 GB libres).
+  Otras carpetas en `Roms/`: `bios`, `fullsets`, `_review`.
 - Árbol secundario de pruebas: `/home/pandi/roms`.
 - Herramientas incluidas por EmuDeck:
   `~/.config/EmuDeck/backend/tools/chdconv/`
@@ -179,6 +179,16 @@ Listas relevantes:
   - Si no, se mira el contenido (`iso_kind`) y luego el tamaño.
 - `.gcm`, `.wbfs` → RVZ.
 - `.3ds`, `.cci` → recorte 3DS. El archivo se renombra a `(Trimmed)`.
+- Disquetes X68000 (`d88`, `88d`, `dim`, `hdm`, `2hd`, `xdf`, `dup`) → 7z,
+  **solo si `system_hint` es `x68000`** (alias `x68k`, `sharpx68000`), porque
+  `.d88`/`.dim` también son de PC-88/PC-98. `is_x68k_floppy_ext()`.
+- `.hdf` (disco duro X68000, escribible), `.nds`, `.cia`, `.cdi` → se omiten.
+- `.m3u`: un archivo listado en un `.m3u` de su carpeta **no va a 7z**
+  (`is_m3u_entry`, caché `M3U_CACHE` que se carga con `m3u_load_dir` en el
+  proceso principal porque `classify_compress` corre en `$(...)`).
+  Los `.cue`/`.gdi` listados sí van a CHD. Con `--delete`, `m3u_retarget`
+  reescribe la entrada (`.cue` ↔ `.chd`), conservando rutas y CRLF.
+  Comentarios `#` se respetan; acepta rutas con `\` y `/`.
 - `.bin`, `.rom`, `.dsk`:
   - Solo se pasan a 7z si el sistema es de cartucho.
   - `.bin` exige tamaño `>= 64 KiB`; `.rom`/`.dsk`, `>= 16 KiB`.
@@ -253,7 +263,23 @@ Detección en el script:
   - Dry-run en `/run/media/pandi/Roms/sistemas`: `gc` 35 conversiones,
     `wii` 11 (ISO y WBFS), 0 errores.
 
-### Barrido real completo
+- X68000/MSX/PSX con `.m3u` (pruebas sintéticas): discos listados omitidos de
+  7z, `.d88` de PC-98 omitido, PSX multidisco `compress --delete` y
+  `decompress --delete` reescriben el `.m3u` en ambos sentidos con CRLF.
+- `sistemas/x68000` está entero ya en `.7z` (1113 juegos); no hay disquetes
+  sueltos en ningún árbol.
+
+### Barrido de `sistemas` (2026-11-10, tras X68000/m3u)
+
+`list /run/media/pandi/Roms/sistemas` → **4419 se convertirían, 47644
+omitidos, 0 errores (de 52063 archivos)**, 17 min 47 s (sys 11 min: muchos
+subprocesos sobre disco USB). 7z 3927, CHD CD 324, CHD DVD 82, CSO 39, RVZ 46,
+3DS 1. Comparado con la versión anterior del script carpeta a carpeta
+(`gb`, `gbc`, `pcengine`, `pcengine.check`, `megacd.check.2`, `32x`,
+`x68000`): salida idéntica; las diferencias con el barrido de `202611` vienen
+de cambios en el árbol del usuario.
+
+### Barrido real completo (antiguo, árbol `202611`)
 
 Comando:
 
